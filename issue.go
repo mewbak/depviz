@@ -10,10 +10,24 @@ import (
 	"github.com/awalterschulze/gographviz"
 	"github.com/google/go-github/github"
 	"github.com/spf13/viper"
+	gitlab "github.com/xanzy/go-gitlab"
+)
+
+type Provider string
+
+const (
+	UnknownProvider Provider = "unknown"
+	GitHubProvider           = "github"
+	GitLabProvider           = "gitlab"
 )
 
 type Issue struct {
-	github.Issue
+	// proxy
+	GitHub *github.Issue
+	GitLab *gitlab.Issue
+
+	// internal
+	Provider         Provider
 	DependsOn        IssueSlice
 	Blocks           IssueSlice
 	weightMultiplier int
@@ -23,6 +37,62 @@ type Issue struct {
 	IsDuplicate      int
 	LinkedWithEpic   bool
 	Errors           []error
+
+	// mapping
+	Number    int
+	Title     string
+	State     string
+	Body      string
+	RepoURL   string
+	URL       string
+	Labels    []*IssueLabel
+	Assignees []*Profile
+}
+
+type IssueLabel struct {
+	Name  string
+	Color string
+}
+
+type Profile struct {
+	Name     string
+	Username string
+}
+
+func FromGitHubIssue(input *github.Issue) *Issue {
+	body := ""
+	if input.Body != nil {
+		body = *input.Body
+	}
+	issue := &Issue{
+		Provider:  GitHubProvider,
+		GitHub:    input,
+		Number:    *input.Number,
+		Title:     *input.Title,
+		State:     *input.State,
+		Body:      body,
+		URL:       *input.HTMLURL,
+		RepoURL:   *input.RepositoryURL,
+		Labels:    make([]*IssueLabel, 0),
+		Assignees: make([]*Profile, 0),
+	}
+	return issue
+}
+
+func FromGitLabIssue(input *gitlab.Issue) *Issue {
+	issue := &Issue{
+		Provider:  GitLabProvider,
+		GitLab:    input,
+		Number:    input.ID,
+		Title:     input.Title,
+		State:     input.State,
+		URL:       input.WebURL,
+		Body:      input.Description,
+		RepoURL:   input.Links.Project,
+		Labels:    make([]*IssueLabel, 0),
+		Assignees: make([]*Profile, 0),
+	}
+	return issue
 }
 
 type IssueSlice []*Issue
@@ -51,7 +121,7 @@ func (s IssueSlice) ToMap() Issues {
 
 func (i Issue) IsEpic() bool {
 	for _, label := range i.Labels {
-		if *label.Name == viper.GetString("epic-label") {
+		if label.Name == viper.GetString("epic-label") {
 			return true
 		}
 	}
@@ -60,7 +130,7 @@ func (i Issue) IsEpic() bool {
 }
 
 func (i Issue) Repo() string {
-	return strings.Split(*i.RepositoryURL, "/")[5]
+	return strings.Split(i.URL, "/")[5]
 }
 
 func (i Issue) FullRepo() string {
@@ -68,15 +138,18 @@ func (i Issue) FullRepo() string {
 }
 
 func (i Issue) RepoID() string {
-	return strings.Replace(i.FullRepo(), "/", "", -1)
+	id := i.FullRepo()
+	id = strings.Replace(id, "/", "", -1)
+	id = strings.Replace(id, "-", "", -1)
+	return id
 }
 
 func (i Issue) Owner() string {
-	return strings.Split(*i.RepositoryURL, "/")[4]
+	return strings.Split(i.URL, "/")[4]
 }
 
 func (i Issue) IsClosed() bool {
-	return *i.State == "closed"
+	return i.State == "closed"
 }
 
 func (i Issue) IsReady() bool {
@@ -84,19 +157,19 @@ func (i Issue) IsReady() bool {
 }
 
 func (i Issue) NodeName() string {
-	return fmt.Sprintf(`%s#%d`, i.FullRepo(), *i.Number)
+	return fmt.Sprintf(`%s#%d`, i.FullRepo(), i.Number)
 }
 
 func (i Issue) NodeTitle() string {
-	title := fmt.Sprintf("%s: %s", i.NodeName(), *i.Title)
+	title := fmt.Sprintf("%s: %s", i.NodeName(), i.Title)
 	title = strings.Replace(html.EscapeString(wrap(title, 20)), "\n", "<br/>", -1)
 	labels := []string{}
 	for _, label := range i.Labels {
-		switch *label.Name {
+		switch label.Name {
 		case "t/step", "t/epic":
 			continue
 		}
-		labels = append(labels, fmt.Sprintf(`<td bgcolor="#%s">%s</td>`, *label.Color, *label.Name))
+		labels = append(labels, fmt.Sprintf(`<td bgcolor="#%s">%s</td>`, label.Color, label.Name))
 	}
 	labelsText := ""
 	if len(labels) > 0 {
@@ -106,7 +179,7 @@ func (i Issue) NodeTitle() string {
 	if len(i.Assignees) > 0 {
 		assignees := []string{}
 		for _, assignee := range i.Assignees {
-			assignees = append(assignees, *assignee.Login)
+			assignees = append(assignees, assignee.Username)
 		}
 		assigneeText = fmt.Sprintf(`<tr><td><font color="purple"><i>@%s</i></font></td></tr>`, strings.Join(assignees, ", @"))
 	}
@@ -199,7 +272,7 @@ func (i Issue) AddNodeToGraph(g *gographviz.Graph, parent string) error {
 	attrs["shape"] = "record"
 	attrs["style"] = `"rounded,filled"`
 	attrs["color"] = "lightblue"
-	attrs["href"] = escape(*i.HTMLURL)
+	attrs["href"] = escape(i.URL)
 
 	if i.IsEpic() {
 		attrs["shape"] = "oval"
@@ -247,28 +320,28 @@ func (issues Issues) prepare() error {
 		issue.BaseWeight = 1
 	}
 	for _, issue := range issues {
-		if issue.Body == nil {
+		if issue.Body == "" {
 			continue
 		}
 
-		if match := isDuplicateRegex.FindStringSubmatch(*issue.Body); match != nil {
+		if match := isDuplicateRegex.FindStringSubmatch(issue.Body); match != nil {
 			issue.IsDuplicate, _ = strconv.Atoi(match[len(match)-1])
 		}
 
-		if match := weightMultiplierRegex.FindStringSubmatch(*issue.Body); match != nil {
+		if match := weightMultiplierRegex.FindStringSubmatch(issue.Body); match != nil {
 			issue.weightMultiplier, _ = strconv.Atoi(match[len(match)-1])
 		}
 
-		if match := hideFromRoadmapRegex.FindStringSubmatch(*issue.Body); match != nil {
+		if match := hideFromRoadmapRegex.FindStringSubmatch(issue.Body); match != nil {
 			delete(issues, issue.NodeName())
 			continue
 		}
 
-		if match := baseWeightRegex.FindStringSubmatch(*issue.Body); match != nil {
+		if match := baseWeightRegex.FindStringSubmatch(issue.Body); match != nil {
 			issue.BaseWeight, _ = strconv.Atoi(match[len(match)-1])
 		}
 
-		for _, match := range dependsOnRegex.FindAllStringSubmatch(*issue.Body, -1) {
+		for _, match := range dependsOnRegex.FindAllStringSubmatch(issue.Body, -1) {
 			num := match[len(match)-1]
 			if num[0] == '#' {
 				num = fmt.Sprintf(`%s%s`, issue.FullRepo(), num)
@@ -284,7 +357,7 @@ func (issues Issues) prepare() error {
 			issues[num].IsOrphan = false
 		}
 
-		for _, match := range blocksRegex.FindAllStringSubmatch(*issue.Body, -1) {
+		for _, match := range blocksRegex.FindAllStringSubmatch(issue.Body, -1) {
 			num := match[len(match)-1]
 			if num[0] == '#' {
 				num = fmt.Sprintf(`%s%s`, issue.FullRepo(), num)
@@ -304,12 +377,22 @@ func (issues Issues) prepare() error {
 		if issue.IsDuplicate != 0 {
 			issue.Hidden = true
 		}
-		if issue.PullRequestLinks != nil {
+		if issue.IsPR() {
 			issue.Hidden = true
 		}
 	}
 	issues.processEpicLinks()
 	return nil
+}
+
+func (i Issue) IsPR() bool {
+	switch i.Provider {
+	case GitHubProvider:
+		return i.GitHub.PullRequestLinks != nil
+	case GitLabProvider:
+		return false // only fetching issues for now
+	}
+	panic("should not happen")
 }
 
 func (issues Issues) processEpicLinks() {
