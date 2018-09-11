@@ -162,6 +162,7 @@ func (i Issue) NodeName() string {
 
 func (i Issue) NodeTitle() string {
 	title := fmt.Sprintf("%s: %s", i.NodeName(), i.Title)
+	title = strings.Replace(title, "|", "-", -1)
 	title = strings.Replace(html.EscapeString(wrap(title, 20)), "\n", "<br/>", -1)
 	labels := []string{}
 	for _, label := range i.Labels {
